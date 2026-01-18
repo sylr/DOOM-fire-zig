@@ -8,8 +8,8 @@ const std = @import("std");
 
 const allocator = std.heap.page_allocator;
 
-var stdout: std.fs.File.Writer = undefined;
-var stdin: std.fs.File.Reader = undefined;
+var stdout_file: std.fs.File = undefined;
+var stdin_file: std.fs.File = undefined;
 var g_tty_win: win32.HANDLE = undefined;
 
 ///////////////////////////////////
@@ -91,6 +91,7 @@ var g_tty_win: win32.HANDLE = undefined;
 ///////////////////////////////////
 
 //// consts, vars, settings
+var prng: std.Random.DefaultPrng = undefined;
 var rand: std.Random = undefined;
 
 //// functions
@@ -98,7 +99,7 @@ var rand: std.Random = undefined;
 // seed & prep for rng
 pub fn initRNG() !void {
     //rnd setup -- https://ziglearn.org/chapter-2/#random-numbers
-    var prng = std.Random.DefaultPrng.init(blk: {
+    prng = std.Random.DefaultPrng.init(blk: {
         var seed: u64 = undefined;
         try std.posix.getrandom(std.mem.asBytes(&seed));
         break :blk seed;
@@ -117,10 +118,7 @@ pub fn emit(s: []const u8) !void {
         }
         return;
     } else {
-        const sz = try stdout.write(s);
-        if (sz == 0) {
-            return;
-        } // cauze I c
+        try stdout_file.writeAll(s);
         return;
     }
 }
@@ -231,7 +229,7 @@ pub fn getTermSzLinux() !TermSz {
     //Linux-MacOS Case
 
     //base case - invoked from cmd line
-    const tty_nix = stdout.context.handle;
+    const tty_nix = stdout_file.handle;
     var winsz = std.c.winsize{ .col = 0, .row = 0, .xpixel = 0, .ypixel = 0 };
     const rv = std.c.ioctl(tty_nix, TIOCGWINSZ, @intFromPtr(&winsz));
     const err = std.posix.errno(rv);
@@ -338,10 +336,9 @@ pub fn pause() !void {
 
     try emit(color_reset);
     try emit("Press return to continue...");
-    var b: u8 = undefined;
-    b = stdin.readByte() catch undefined;
-
-    if (b == 'q') {
+    var b_buf: [1]u8 = undefined;
+    const n = stdin_file.read(&b_buf) catch 0;
+    if (n == 1 and b_buf[0] == 'q') {
         //exit cleanly
         try complete();
         std.process.exit(0);
@@ -576,11 +573,11 @@ pub fn scrollMarquee() !void {
             try emit(line_clear_to_eol);
             try emit(nl);
 
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
 
         //let quote chill for a second
-        std.time.sleep(1000 * std.time.ns_per_ms);
+        std.Thread.sleep(1000 * std.time.ns_per_ms);
 
         //fade out
         fade_idx = fade_len - 1;
@@ -598,7 +595,7 @@ pub fn scrollMarquee() !void {
             try emit(txt[txt_idx * 2 + 1]);
             try emit(line_clear_to_eol);
             try emit(nl);
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
         try emit(nl);
     }
@@ -689,7 +686,7 @@ pub fn paintBuf() !void {
     fps = @as(f64, @floatFromInt(bs_frame_tic)) / t_dur;
 
     try emit(fg[0]);
-    try emitFmt("mem: {s:.2} min / {s:.2} avg / {s:.2} max [ {d:.2} fps ]", .{ std.fmt.fmtIntSizeBin(bs_sz_min), std.fmt.fmtIntSizeBin(bs_sz_avg), std.fmt.fmtIntSizeBin(bs_sz_max), fps });
+    try emitFmt("mem: {d} min / {d} avg / {d} max [ {d:.2} fps ]", .{ bs_sz_min, bs_sz_avg, bs_sz_max, fps });
 }
 
 // initBuf(); defer freeBuf();
@@ -835,8 +832,8 @@ pub fn showDoomFire() !void {
 ///////////////////////////////////
 
 pub fn main() anyerror!void {
-    stdout = std.io.getStdOut().writer();
-    stdin = std.io.getStdIn().reader();
+    stdout_file = std.fs.File.stdout();
+    stdin_file = std.fs.File.stdin();
 
     try initTerm();
     defer complete() catch {};
