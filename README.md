@@ -14,6 +14,12 @@ $ cd DOOM-fire-zig
 $ zig build run
 ...
 ```
+
+On terminals that support the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (kitty, Ghostty, WezTerm, ...), draw the fire as an image instead of text:
+```
+$ zig build run -- --kitty
+```
+
 Build Requirements:
 * all platforms - libc
 * all platforms - x64 (for now)

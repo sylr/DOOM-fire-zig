@@ -13,6 +13,16 @@ var stdout: std.Io.File = undefined;
 var stdin: std.Io.File = undefined;
 var g_tty_win: win32.HANDLE = undefined;
 
+// render mode, picked from the command line
+const Mode = enum {
+    text, // ANSI 256-color half-block characters (default)
+    kitty, // kitty graphics protocol, zlib-compressed RGB sent inline
+};
+var mode: Mode = .text;
+
+// set by SIGINT while the fire runs so we can exit through complete()
+var stop_requested = std.atomic.Value(bool).init(false);
+
 ///////////////////////////////////
 // Tested on M1 osx15.3, Windows 10 on Intel + Artix Linux.
 //   fast  - vs code terminal
@@ -322,6 +332,9 @@ pub fn initTerm() !void {
 pub fn complete() !void {
     //todo -- free colors
     //todo if win, completeWin() -> restore code page
+    if (mode == .kitty) {
+        try emit(kitty_delete);
+    }
     try emit(term_off);
     try emit("Complete!" ++ nl);
 }
@@ -633,14 +646,15 @@ var t_now: i64 = 0;
 var t_dur: f64 = 0.0;
 var fps: f64 = 0.0;
 
-pub fn initBuf() !void {
+// extra_sz: room needed beyond a text frame (kitty frames)
+pub fn initBuf(extra_sz: u64) !void {
     //worst case per cell: a fg + bg color change and a pixel glyph; plus a newline per row.
     const px_char_sz = px.len;
     const px_color_sz = bg[LAST_COLOR].len + fg[LAST_COLOR].len;
     const px_sz = px_color_sz + px_char_sz;
     const screen_sz: u64 = @as(u64, (px_sz * term_sz.width + nl.len) * term_sz.height);
     const overflow_sz: u64 = px_char_sz * 100;
-    const bs_sz: u64 = screen_sz + overflow_sz;
+    const bs_sz: u64 = screen_sz + overflow_sz + extra_sz;
 
     bs = try allocator.alloc(u8, bs_sz);
     t_start = std.Io.Timestamp.now(io, .awake).toMilliseconds();
@@ -691,13 +705,140 @@ pub fn paintBuf() !void {
     t_dur = @as(f64, @floatFromInt(t_now - t_start)) / 1000.0;
     fps = @as(f64, @floatFromInt(bs_frame_tic)) / t_dur;
 
-    try emit(fg[0]);
+    if (mode == .kitty) {
+        // status sits below the image, on the default colors
+        try emit(color_def);
+        try emitFmt("kitty | ", .{});
+    } else {
+        try emit(fg[0]);
+    }
     try emitFmt("mem: {Bi:.2} min / {Bi:.2} avg / {Bi:.2} max [ {d:.2} fps ]", .{ bs_sz_min, bs_sz_avg, bs_sz_max, fps });
 }
 
 // initBuf(); defer freeBuf();
 pub fn freeBuf() void {
     allocator.free(bs);
+}
+
+//colors - tinker w/palette as needed!
+const fire_palette = [_]u8{ 0, 233, 234, 52, 53, 88, 89, 94, 95, 96, 130, 131, 132, 133, 172, 214, 215, 220, 220, 221, 3, 226, 227, 230, 195, 230 };
+
+/// Kitty graphics mode
+/// The fire buffer becomes an RGB image (one pixel per fire cell), zlib-compressed,
+/// base64-encoded and sent inline in 4096-byte chunks. The terminal scales it to the pane.
+/// Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+
+// default xterm RGB value of a 256-color index, so the image matches text mode
+fn xterm256(c: u8) [3]u8 {
+    const sys = [16][3]u8{
+        .{ 0, 0, 0 },       .{ 128, 0, 0 },   .{ 0, 128, 0 },   .{ 128, 128, 0 },
+        .{ 0, 0, 128 },     .{ 128, 0, 128 }, .{ 0, 128, 128 }, .{ 192, 192, 192 },
+        .{ 128, 128, 128 }, .{ 255, 0, 0 },   .{ 0, 255, 0 },   .{ 255, 255, 0 },
+        .{ 0, 0, 255 },     .{ 255, 0, 255 }, .{ 0, 255, 255 }, .{ 255, 255, 255 },
+    };
+    if (c < 16) return sys[c];
+    if (c < 232) {
+        const lv = [6]u8{ 0, 95, 135, 175, 215, 255 };
+        const i = c - 16;
+        return .{ lv[i / 36], lv[(i / 6) % 6], lv[i % 6] };
+    }
+    const g: u8 = 8 + 10 * (c - 232);
+    return .{ g, g, g };
+}
+
+const fire_rgb = blk: {
+    var t: [fire_palette.len][3]u8 = undefined;
+    for (fire_palette, 0..) |c, i| t[i] = xterm256(c);
+    break :blk t;
+};
+
+const kitty_image_id = 1;
+const kitty_chunk_raw = 3072; // raw bytes per chunk => 4096 base64 chars, the protocol maximum
+const kitty_delete = esc ++ "_Ga=d,d=I,i=" ++ std.fmt.comptimePrint("{d}", .{kitty_image_id}) ++ ",q=2" ++ esc ++ "\\";
+
+const Kitty = struct {
+    rgb: []u8, // W*H*3 pixels
+    z: []u8, // zlib output
+    window: []u8, // compressor history buffer
+    deflate: *std.compress.flate.Compress,
+
+    // worst-case zlib output for n bytes: stored blocks cost 5 bytes per 64K, plus header/footer
+    fn zCap(n: usize) usize {
+        return n + n / 8 + 1024;
+    }
+
+    // worst-case bytes a frame adds to the render buffer
+    fn frameCap(w: u64, h: u64) u64 {
+        const z = zCap(w * h * 3);
+        const chunks = z / kitty_chunk_raw + 1;
+        return std.base64.standard.Encoder.calcSize(z) + chunks * 16 + 256;
+    }
+
+    fn init(w: u64, h: u64) !Kitty {
+        const rgb = try allocator.alloc(u8, w * h * 3);
+        return .{
+            .rgb = rgb,
+            .z = try allocator.alloc(u8, zCap(rgb.len)),
+            .window = try allocator.alloc(u8, std.compress.flate.max_window_len),
+            .deflate = try allocator.create(std.compress.flate.Compress),
+        };
+    }
+
+    fn deinit(k: *Kitty) void {
+        allocator.free(k.rgb);
+        allocator.free(k.z);
+        allocator.free(k.window);
+        allocator.destroy(k.deflate);
+    }
+
+    // append one frame to the render buffer: image at the cursor, scaled to cols x rows cells
+    fn drawFrame(k: *Kitty, screen_buf: []const u8, w: u64, h: u64, cols: u64, rows: u64) !void {
+        for (screen_buf, 0..) |px_idx, i| {
+            k.rgb[i * 3 ..][0..3].* = fire_rgb[px_idx];
+        }
+
+        var zw: std.Io.Writer = .fixed(k.z);
+        k.deflate.* = try .init(&zw, k.window, .zlib, .level_1);
+        try k.deflate.writer.writeAll(k.rgb);
+        try k.deflate.finish();
+        const z = zw.buffered();
+
+        var off: usize = 0;
+        var first = true;
+        while (first or off < z.len) {
+            const n = @min(kitty_chunk_raw, z.len - off);
+            const more: u8 = if (off + n < z.len) 1 else 0;
+            var hdr: [160]u8 = undefined;
+            if (first) {
+                // a=T transmit+display, f=24 RGB, o=z zlib, C=1 keep cursor, q=2 no replies
+                drawBuf(try std.fmt.bufPrint(&hdr, esc ++ "_Ga=T,f=24,o=z,s={d},v={d},i={d},p=1,c={d},r={d},C=1,q=2,m={d};", .{ w, h, kitty_image_id, cols, rows, more }));
+            } else {
+                drawBuf(try std.fmt.bufPrint(&hdr, esc ++ "_Gm={d};", .{more}));
+            }
+            const enc = std.base64.standard.Encoder;
+            _ = enc.encode(bs[bs_idx..][0..enc.calcSize(n)], z[off..][0..n]);
+            bs_idx += enc.calcSize(n);
+            bs_len += enc.calcSize(n);
+            drawBuf(esc ++ "\\");
+            off += n;
+            first = false;
+        }
+    }
+};
+
+// SIGINT while the fire runs: finish the current frame, then exit through complete()
+fn onSigInt(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .monotonic);
+}
+
+fn installSigInt() void {
+    if (std.posix.Sigaction == void) return; // windows: keep default ctrl+c behavior
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onSigInt },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.INT, &act, null);
 }
 
 pub fn showDoomFire() !void {
@@ -707,8 +848,6 @@ pub fn showDoomFire() !void {
     const FIRE_SZ: u64 = FIRE_H * FIRE_W;
     const FIRE_LAST_ROW: u64 = (FIRE_H - 1) * FIRE_W;
 
-    //colors - tinker w/palette as needed!
-    const fire_palette = [_]u8{ 0, 233, 234, 52, 53, 88, 89, 94, 95, 96, 130, 131, 132, 133, 172, 214, 215, 220, 220, 221, 3, 226, 227, 230, 195, 230 };
     const fire_black: u8 = 0;
     const fire_white: u8 = fire_palette.len - 1;
 
@@ -760,13 +899,20 @@ pub fn showDoomFire() !void {
     var cur_fg: u8 = 0; // colors currently set on the terminal
     var cur_bg: u8 = 0;
 
+    //kitty mode: image covers all rows but the last, which holds the status line
+    var kitty: ?Kitty = if (mode == .kitty) try Kitty.init(FIRE_W, FIRE_H) else null;
+    defer if (kitty) |*k| k.deinit();
+    const kitty_rows: u64 = @max(1, term_sz.height -| 1);
+    const status_pos = try std.fmt.allocPrint(allocator, csi ++ "{d};1H", .{term_sz.height});
+    defer allocator.free(status_pos);
+
     //get to work!
-    try initBuf();
+    try initBuf(if (mode == .kitty) Kitty.frameCap(FIRE_W, FIRE_H) + status_pos.len else 0);
     defer freeBuf();
 
     //when there is an ez way to poll for key stroke...do that.  for now, ctrl+c!
-    const ok = true;
-    while (ok) {
+    installSigInt();
+    while (!stop_requested.load(.monotonic)) {
 
         //update fire buf
         doFire_x = 0;
@@ -797,6 +943,15 @@ pub fn showDoomFire() !void {
                     }
                 }
             }
+        }
+
+        if (kitty) |*k| {
+            resetBuf();
+            drawBuf(cursor_home);
+            try k.drawFrame(screen_buf, FIRE_W, FIRE_H, FIRE_W, kitty_rows);
+            drawBuf(status_pos);
+            try paintBuf();
+            continue;
         }
 
         //paint fire buf
@@ -851,10 +1006,27 @@ pub fn showDoomFire() !void {
 // main
 ///////////////////////////////////
 
+const usage =
+    \\usage: DOOM-fire [--kitty]
+    \\
+    \\  --kitty   draw the fire with the kitty graphics protocol (kitty, Ghostty, WezTerm, Rex...)
+    \\
+;
+
 pub fn main(init: std.process.Init) anyerror!void {
     io = init.io;
     stdout = std.Io.File.stdout();
     stdin = std.Io.File.stdin();
+
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--kitty")) {
+            mode = .kitty;
+        } else {
+            try std.Io.File.stderr().writeStreamingAll(io, usage);
+            std.process.exit(if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) 0 else 2);
+        }
+    }
 
     try initTerm();
     defer complete() catch {};
