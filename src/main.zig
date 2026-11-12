@@ -734,7 +734,7 @@ const fire_palette = [_]u8{ 0, 233, 234, 52, 53, 88, 89, 94, 95, 96, 130, 131, 1
 /// base64-encoded and sent inline in 4096-byte chunks. The terminal scales it to the pane.
 /// Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
-// default xterm RGB value of a 256-color index, so the image matches text mode
+// default xterm RGB value of a 256-color index, used when the terminal doesn't report its palette
 fn xterm256(c: u8) [3]u8 {
     const sys = [16][3]u8{
         .{ 0, 0, 0 },       .{ 128, 0, 0 },   .{ 0, 128, 0 },   .{ 128, 128, 0 },
@@ -752,11 +752,86 @@ fn xterm256(c: u8) [3]u8 {
     return .{ g, g, g };
 }
 
-const fire_rgb = blk: {
+// RGB of each fire palette entry; queryTerm() replaces these with the terminal's own colors
+var fire_rgb: [fire_palette.len][3]u8 = blk: {
     var t: [fire_palette.len][3]u8 = undefined;
     for (fire_palette, 0..) |c, i| t[i] = xterm256(c);
     break :blk t;
 };
+
+// Ask the terminal for the RGB of each palette color (OSC 4), so the image looks like text mode.
+// A trailing DA1 query (CSI c), which every terminal answers, marks the end of the replies.
+// Unanswered colors keep the xterm defaults.
+fn queryTerm() void {
+    if (builtin.os.tag == .windows) return;
+
+    const fd = stdin.handle;
+    const saved = std.posix.tcgetattr(fd) catch return;
+    var raw = saved;
+    raw.lflag.ICANON = false; // replies arrive without a newline
+    raw.lflag.ECHO = false; // and must not be echoed back
+    std.posix.tcsetattr(fd, .NOW, raw) catch return;
+    defer std.posix.tcsetattr(fd, .NOW, saved) catch {};
+
+    var q_buf: [1024]u8 = undefined;
+    var q: std.Io.Writer = .fixed(&q_buf);
+    for (fire_palette) |c| q.print(esc ++ "]4;{d};?" ++ esc ++ "\\", .{c}) catch return;
+    q.writeAll(csi ++ "c") catch return;
+    emit(q.buffered()) catch return;
+
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len and !hasDA1(buf[0..len])) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 500) catch break;
+        if (ready == 0) break; // terminal went quiet
+        const n = stdin.readStreaming(io, &.{buf[len..]}) catch break;
+        if (n == 0) break;
+        len += n;
+    }
+    parseReplies(buf[0..len]);
+}
+
+fn hasDA1(r: []const u8) bool {
+    const i = std.mem.indexOf(u8, r, csi ++ "?") orelse return false;
+    return std.mem.indexOfScalarPos(u8, r, i, 'c') != null;
+}
+
+fn parseReplies(r: []const u8) void {
+    // OSC 4 ; index ; rgb:RRRR/GGGG/BBBB  (1-4 hex digits per channel), ended by ST or BEL
+    var it = std.mem.splitSequence(u8, r, esc ++ "]4;");
+    _ = it.next();
+    while (it.next()) |rest| {
+        const semi = std.mem.indexOfScalar(u8, rest, ';') orelse continue;
+        const idx = std.fmt.parseInt(u8, rest[0..semi], 10) catch continue;
+        const spec = rest[semi + 1 ..];
+        if (!std.mem.startsWith(u8, spec, "rgb:")) continue;
+        const end = std.mem.indexOfAny(u8, spec, "\x07\x1b") orelse continue;
+        var ch = std.mem.splitScalar(u8, spec[4..end], '/');
+        var rgb: [3]u8 = undefined;
+        var ok = true;
+        for (&rgb) |*v| {
+            const hex = ch.next() orelse {
+                ok = false;
+                break;
+            };
+            if (hex.len == 0 or hex.len > 4) {
+                ok = false;
+                break;
+            }
+            const x = std.fmt.parseInt(u32, hex, 16) catch {
+                ok = false;
+                break;
+            };
+            const max = (@as(u32, 1) << @intCast(4 * hex.len)) - 1;
+            v.* = @intCast((x * 255 + max / 2) / max);
+        }
+        if (!ok) continue;
+        for (fire_palette, 0..) |c, i| {
+            if (c == idx) fire_rgb[i] = rgb;
+        }
+    }
+}
 
 const kitty_image_id = 1;
 const kitty_chunk_raw = 3072; // raw bytes per chunk => 4096 base64 chars, the protocol maximum
@@ -906,6 +981,7 @@ pub fn showDoomFire() !void {
     var cur_bg: u8 = 0;
 
     //kitty mode: image covers all rows but the last, which holds the status line
+    if (mode == .kitty) queryTerm();
     var kitty: ?Kitty = if (mode == .kitty) try Kitty.init(FIRE_W, FIRE_H) else null;
     defer if (kitty) |*k| k.deinit();
     const kitty_rows: u64 = @max(1, term_sz.height -| 1);
