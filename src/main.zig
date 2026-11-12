@@ -640,6 +640,7 @@ var bs_len: u64 = 0;
 var bs_sz_min: u64 = 0;
 var bs_sz_max: u64 = 0;
 var bs_sz_avg: u64 = 0;
+var bs_sz_total: u64 = 0; // bytes emitted so far; avg = total / frames (an incremental integer avg decays to 0)
 var bs_frame_tic: u64 = 0;
 var t_start: i64 = 0;
 var t_now: i64 = 0;
@@ -687,6 +688,7 @@ pub fn paintBuf() !void {
     try emit(bs[0..bs_len]);
     t_now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     bs_frame_tic += 1;
+    bs_sz_total += bs_len;
     if (bs_sz_min == 0) {
         //first frame
         bs_sz_min = bs_len;
@@ -699,7 +701,7 @@ pub fn paintBuf() !void {
         if (bs_len > bs_sz_max) {
             bs_sz_max = bs_len;
         }
-        bs_sz_avg = bs_sz_avg * (bs_frame_tic - 1) / bs_frame_tic + bs_len / bs_frame_tic;
+        bs_sz_avg = bs_sz_total / bs_frame_tic;
     }
 
     t_dur = @as(f64, @floatFromInt(t_now - t_start)) / 1000.0;
