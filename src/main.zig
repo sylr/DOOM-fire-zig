@@ -149,7 +149,7 @@ pub fn emitFmt(comptime s: []const u8, args: anytype) !void {
 const TIOCGWINSZ = std.c.T.IOCGWINSZ; // ioctl flag
 
 //term size
-const TermSz = struct { height: usize, width: usize };
+const TermSz = struct { height: usize, width: usize, xpixel: usize = 0, ypixel: usize = 0 };
 var term_sz: TermSz = .{ .height = 0, .width = 0 }; // set via initTermSz
 
 //ansi escape codes
@@ -261,7 +261,7 @@ pub fn getTermSzLinux() !TermSz {
                 return std.posix.unexpectedErrno(lldb_err);
             }
         } else {
-            return TermSz{ .height = winsz.row, .width = winsz.col };
+            return TermSz{ .height = winsz.row, .width = winsz.col, .xpixel = winsz.xpixel, .ypixel = winsz.ypixel };
         }
     } else {
         std.process.exit(0);
@@ -730,9 +730,10 @@ pub fn freeBuf() void {
 const fire_palette = [_]u8{ 0, 233, 234, 52, 53, 88, 89, 94, 95, 96, 130, 131, 132, 133, 172, 214, 215, 220, 220, 221, 3, 226, 227, 230, 195, 230 };
 
 /// Kitty graphics mode
-/// The fire buffer becomes an RGB image (one pixel per fire cell), zlib-compressed,
-/// base64-encoded and sent inline in 4096-byte chunks. The terminal scales it to the pane.
-/// Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+/// The fire buffer becomes an RGB image sized to the pane in screen pixels, each fire cell a
+/// solid block, so the terminal shows it 1:1 instead of smoothing a small image up (blurry).
+/// The image is zlib-compressed by a tiny purpose-built encoder, base64-encoded and sent inline
+/// in 4096-byte chunks. Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
 // default xterm RGB value of a 256-color index, used when the terminal doesn't report its palette
 fn xterm256(c: u8) [3]u8 {
@@ -759,10 +760,18 @@ var fire_rgb: [fire_palette.len][3]u8 = blk: {
     break :blk t;
 };
 
-// Ask the terminal for the RGB of each palette color (OSC 4), so the image looks like text mode.
-// A trailing DA1 query (CSI c), which every terminal answers, marks the end of the replies.
-// Unanswered colors keep the xterm defaults.
+// cell size in screen pixels, 0 when unknown
+var cell_px_w: u64 = 0;
+var cell_px_h: u64 = 0;
+
+// Ask the terminal what text mode would look like: the RGB of each palette color (OSC 4) and the
+// cell size in pixels (CSI 16 t). A trailing DA1 query (CSI c), which every terminal answers,
+// marks the end of the replies. Unanswered queries keep the defaults.
 fn queryTerm() void {
+    if (term_sz.width > 0 and term_sz.height > 0) {
+        cell_px_w = term_sz.xpixel / term_sz.width;
+        cell_px_h = term_sz.ypixel / term_sz.height;
+    }
     if (builtin.os.tag == .windows) return;
 
     const fd = stdin.handle;
@@ -776,7 +785,7 @@ fn queryTerm() void {
     var q_buf: [1024]u8 = undefined;
     var q: std.Io.Writer = .fixed(&q_buf);
     for (fire_palette) |c| q.print(esc ++ "]4;{d};?" ++ esc ++ "\\", .{c}) catch return;
-    q.writeAll(csi ++ "c") catch return;
+    q.writeAll(csi ++ "16t" ++ csi ++ "c") catch return;
     emit(q.buffered()) catch return;
 
     var buf: [4096]u8 = undefined;
@@ -831,58 +840,242 @@ fn parseReplies(r: []const u8) void {
             if (c == idx) fire_rgb[i] = rgb;
         }
     }
+    // CSI 6 ; height ; width t
+    if (std.mem.indexOf(u8, r, csi ++ "6;")) |i| {
+        const rest = r[i + csi.len + 2 ..];
+        const t = std.mem.indexOfScalar(u8, rest, 't') orelse return;
+        var nums = std.mem.splitScalar(u8, rest[0..t], ';');
+        const h = std.fmt.parseInt(u64, nums.next() orelse return, 10) catch return;
+        const w = std.fmt.parseInt(u64, nums.next() orelse return, 10) catch return;
+        if (h > 0 and w > 0) {
+            cell_px_w = w;
+            cell_px_h = h;
+        }
+    }
 }
 
 const kitty_image_id = 1;
 const kitty_chunk_raw = 3072; // raw bytes per chunk => 4096 base64 chars, the protocol maximum
 const kitty_delete = esc ++ "_Ga=d,d=I,i=" ++ std.fmt.comptimePrint("{d}", .{kitty_image_id}) ++ ",q=2" ++ esc ++ "\\";
+// cap on the decoded image: the terminal inflates and uploads this every frame
+const kitty_max_image_bytes = 8 << 20;
+
+/// zlib stream for an image made of solid blocks, using one fixed-Huffman deflate block:
+/// - a run of same-colored pixels on a row = 3 literal bytes + a copy from 3 bytes back
+/// - a row identical to the one above = a copy from one row back
+/// Work and output size depend on the fire size, not on the image size.
+const BlockZ = struct {
+    out: []u8,
+    pos: usize = 0,
+    bits: u64 = 0,
+    nbits: u6 = 0,
+    // adler-32 of the uncompressed data, maintained arithmetically
+    a: u64 = 1,
+    b: u64 = 0,
+
+    const adler_mod = 65521;
+
+    // fixed Huffman literal/length codes, bit-reversed since deflate sends Huffman codes MSB first
+    const lit_code: [288]u16 = blk: {
+        @setEvalBranchQuota(10_000);
+        var t: [288]u16 = undefined;
+        for (0..288) |s| t[s] = @bitReverse(@as(u16, @intCast(litCode(s)))) >> @intCast(16 - @as(u8, litLen(s)));
+        break :blk t;
+    };
+    fn litLen(s: usize) u4 {
+        return if (s < 144) 8 else if (s < 256) 9 else if (s < 280) 7 else 8;
+    }
+    fn litCode(s: usize) usize {
+        return if (s < 144) 0x30 + s else if (s < 256) 0x190 + s - 144 else if (s < 280) s - 256 else 0xC0 + s - 280;
+    }
+    const len_base = [_]u16{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    const len_extra = [_]u4{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    const dist_base = [_]u16{ 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    const dist_extra = [_]u4{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    // symbol of each match length 3..258
+    const len_sym: [259]u8 = blk: {
+        @setEvalBranchQuota(10_000);
+        var t: [259]u8 = undefined;
+        var i: usize = 0;
+        for (3..259) |l| {
+            while (i + 1 < len_base.len and len_base[i + 1] <= l) i += 1;
+            t[l] = @intCast(i);
+        }
+        break :blk t;
+    };
+
+    const max_dist = 32768;
+    // worst-case bits per match / per literal pixel
+    const match_bits = 8 + 5 + 5 + 13;
+    const pixel_bits = 3 * 9 + match_bits;
+
+    fn cap(src_w: u64, src_h: u64, img_w: u64, img_h: u64) u64 {
+        const copies_per_row = img_w * 3 / 256 + 2;
+        const bits = src_h * (src_w * pixel_bits + copies_per_row * match_bits) + img_h * copies_per_row * match_bits;
+        return bits / 8 + 64;
+    }
+
+    fn put(z: *BlockZ, v: u64, n: u6) void {
+        z.bits |= v << z.nbits;
+        z.nbits += n;
+        if (z.nbits >= 32) {
+            std.mem.writeInt(u32, z.out[z.pos..][0..4], @truncate(z.bits), .little);
+            z.pos += 4;
+            z.bits >>= 32;
+            z.nbits -= 32;
+        }
+    }
+
+    fn sym(z: *BlockZ, s: usize) void {
+        z.put(lit_code[s], litLen(s));
+    }
+
+    // copy `len` (>= 3) bytes from `dist` back, split into matches of at most 258
+    fn copy(z: *BlockZ, len_total: u64, dist: u64) void {
+        var d: usize = 0;
+        while (d + 1 < dist_base.len and dist_base[d + 1] <= dist) d += 1;
+        const dist_code: u64 = @bitReverse(@as(u5, @intCast(d)));
+        var left = len_total;
+        while (left > 0) {
+            var n: u64 = @min(left, 258);
+            if (left - n > 0 and left - n < 3) n = left - 3; // keep the last match >= 3
+            const ls = len_sym[n];
+            z.sym(257 + @as(usize, ls));
+            if (len_extra[ls] > 0) z.put(n - len_base[ls], len_extra[ls]);
+            z.put(dist_code, 5);
+            if (dist_extra[d] > 0) z.put(dist - dist_base[d], dist_extra[d]);
+            left -= n;
+        }
+    }
+
+    // adler-32: append a segment whose bytes d_j (j < len) have s1 = sum(d_j), s2 = sum(d_j * (len - j))
+    fn adlerAppend(z: *BlockZ, len: u64, s1: u64, s2: u64) void {
+        z.b = (z.b + (len % adler_mod) * z.a + s2) % adler_mod;
+        z.a = (z.a + s1) % adler_mod;
+    }
+
+    fn encode(z: *BlockZ, k: *const Kitty, screen_buf: []const u8) []const u8 {
+        z.* = .{ .out = z.out };
+        z.out[0] = 0x78; // zlib header: deflate, 32K window
+        z.out[1] = 0x01;
+        z.pos = 2;
+        z.put(1, 1); // BFINAL
+        z.put(1, 2); // BTYPE = fixed Huffman
+
+        const row_len = k.img_w * 3;
+        for (0..k.src_h) |y| {
+            const src = screen_buf[(k.src_y0 + y) * k.src_w ..][0..k.src_w];
+            // first image row of this fire row: runs of one color
+            var r1: u64 = 0; // sums of the row so far, for adler
+            var r2: u64 = 0;
+            var x: usize = 0;
+            while (x < k.src_w) {
+                const rgb = fire_rgb[src[x]];
+                var x_end = x + 1;
+                while (x_end < k.src_w and std.mem.eql(u8, &fire_rgb[src[x_end]], &rgb)) x_end += 1;
+                const m: u64 = k.col_x[x_end] - k.col_x[x];
+                for (rgb) |c| z.sym(c);
+                if (m > 1) z.copy(3 * (m - 1), 3);
+
+                // adler sums of rgb repeated m times (len 3m)
+                const seg_len = 3 * m;
+                var s1: u64 = 0;
+                var s2: u64 = 0;
+                for (rgb, 0..) |c, t| {
+                    s1 += m * c;
+                    s2 += c * (m * (seg_len - t) - 3 * m * (m - 1) / 2);
+                }
+                r2 = (r2 + (seg_len % adler_mod) * r1 + s2) % adler_mod;
+                r1 = (r1 + s1) % adler_mod;
+                x = x_end;
+            }
+            z.adlerAppend(row_len, r1, r2);
+            // the rest of the block: copies of the row above
+            const reps = k.row_y[y + 1] - k.row_y[y] - 1;
+            for (0..reps) |_| {
+                z.copy(row_len, row_len);
+                z.adlerAppend(row_len, r1, r2);
+            }
+        }
+        z.sym(256); // end of block
+        if (z.nbits % 8 != 0) z.put(0, @intCast(8 - z.nbits % 8));
+        while (z.nbits > 0) {
+            z.out[z.pos] = @truncate(z.bits);
+            z.pos += 1;
+            z.bits >>= 8;
+            z.nbits -= 8;
+        }
+        std.mem.writeInt(u32, z.out[z.pos..][0..4], @intCast((z.b << 16) | z.a), .big);
+        z.pos += 4;
+        return z.out[0..z.pos];
+    }
+};
 
 const Kitty = struct {
-    rgb: []u8, // W*H*3 pixels
-    z: []u8, // zlib output
-    window: []u8, // compressor history buffer
-    deflate: *std.compress.flate.Compress,
+    src_w: u64, // fire pixels shown
+    src_h: u64,
+    src_y0: u64, // first fire row shown
+    img_w: u64, // image size in pixels
+    img_h: u64,
+    cols: u64, // placement in cells
+    rows: u64,
+    col_x: []u64, // fire column x covers image columns col_x[x]..col_x[x+1]
+    row_y: []u64, // fire row y covers image rows row_y[y]..row_y[y+1]
+    z: BlockZ,
 
-    // worst-case zlib output for n bytes: stored blocks cost 5 bytes per 64K, plus header/footer
-    fn zCap(n: usize) usize {
-        return n + n / 8 + 1024;
-    }
-
-    // worst-case bytes a frame adds to the render buffer
-    fn frameCap(w: u64, h: u64) u64 {
-        const z = zCap(w * h * 3);
-        const chunks = z / kitty_chunk_raw + 1;
-        return std.base64.standard.Encoder.calcSize(z) + chunks * 16 + 256;
-    }
-
-    fn init(w: u64, h: u64) !Kitty {
-        const rgb = try allocator.alloc(u8, w * h * 3);
+    // fire_w x fire_h buffer shown on cols x rows cells: fire_w == cols, 2 fire rows per cell row
+    fn init(fire_w: u64, fire_h: u64, cols: u64, rows: u64) !Kitty {
+        const src_h = @min(fire_h, rows * 2);
+        var img_w = fire_w;
+        var img_h = src_h;
+        if (cell_px_w > 0 and cell_px_h > 0) {
+            // the pane in screen pixels, shrunk until it fits the caps
+            var d: u64 = 1;
+            while (true) : (d += 1) {
+                const w = cols * cell_px_w / d;
+                const h = rows * cell_px_h / d;
+                if (w < fire_w or h < src_h) break; // smaller than the fire itself: stay 1:1
+                if (w * h * 3 <= kitty_max_image_bytes and w * 3 <= BlockZ.max_dist) {
+                    img_w = w;
+                    img_h = h;
+                    break;
+                }
+            }
+        }
+        const col_x = try allocator.alloc(u64, fire_w + 1);
+        for (col_x, 0..) |*v, x| v.* = x * img_w / fire_w;
+        const row_y = try allocator.alloc(u64, src_h + 1);
+        for (row_y, 0..) |*v, y| v.* = y * img_h / src_h;
         return .{
-            .rgb = rgb,
-            .z = try allocator.alloc(u8, zCap(rgb.len)),
-            .window = try allocator.alloc(u8, std.compress.flate.max_window_len),
-            .deflate = try allocator.create(std.compress.flate.Compress),
+            .src_w = fire_w,
+            .src_h = src_h,
+            .src_y0 = fire_h - src_h,
+            .img_w = img_w,
+            .img_h = img_h,
+            .cols = cols,
+            .rows = rows,
+            .col_x = col_x,
+            .row_y = row_y,
+            .z = .{ .out = try allocator.alloc(u8, BlockZ.cap(fire_w, src_h, img_w, img_h)) },
         };
     }
 
     fn deinit(k: *Kitty) void {
-        allocator.free(k.rgb);
-        allocator.free(k.z);
-        allocator.free(k.window);
-        allocator.destroy(k.deflate);
+        allocator.free(k.col_x);
+        allocator.free(k.row_y);
+        allocator.free(k.z.out);
     }
 
-    // append one frame to the render buffer: image at the cursor, scaled to cols x rows cells
-    fn drawFrame(k: *Kitty, screen_buf: []const u8, w: u64, h: u64, cols: u64, rows: u64) !void {
-        for (screen_buf, 0..) |px_idx, i| {
-            k.rgb[i * 3 ..][0..3].* = fire_rgb[px_idx];
-        }
+    // worst-case bytes a frame adds to the render buffer
+    fn frameCap(k: *const Kitty) u64 {
+        const z = k.z.out.len;
+        const chunks = z / kitty_chunk_raw + 1;
+        return std.base64.standard.Encoder.calcSize(z) + chunks * 16 + 256;
+    }
 
-        var zw: std.Io.Writer = .fixed(k.z);
-        k.deflate.* = try .init(&zw, k.window, .zlib, .level_1);
-        try k.deflate.writer.writeAll(k.rgb);
-        try k.deflate.finish();
-        const z = zw.buffered();
+    // append one frame to the render buffer: the image at the cursor, on cols x rows cells
+    fn drawFrame(k: *Kitty, screen_buf: []const u8) !void {
+        const z = k.z.encode(k, screen_buf);
 
         var off: usize = 0;
         var first = true;
@@ -892,7 +1085,7 @@ const Kitty = struct {
             var hdr: [160]u8 = undefined;
             if (first) {
                 // a=T transmit+display, f=24 RGB, o=z zlib, C=1 keep cursor, q=2 no replies
-                drawBuf(try std.fmt.bufPrint(&hdr, esc ++ "_Ga=T,f=24,o=z,s={d},v={d},i={d},p=1,c={d},r={d},C=1,q=2,m={d};", .{ w, h, kitty_image_id, cols, rows, more }));
+                drawBuf(try std.fmt.bufPrint(&hdr, esc ++ "_Ga=T,f=24,o=z,s={d},v={d},i={d},p=1,c={d},r={d},C=1,q=2,m={d};", .{ k.img_w, k.img_h, kitty_image_id, k.cols, k.rows, more }));
             } else {
                 drawBuf(try std.fmt.bufPrint(&hdr, esc ++ "_Gm={d};", .{more}));
             }
@@ -981,15 +1174,15 @@ pub fn showDoomFire() !void {
     var cur_bg: u8 = 0;
 
     //kitty mode: image covers all rows but the last, which holds the status line
-    if (mode == .kitty) queryTerm();
-    var kitty: ?Kitty = if (mode == .kitty) try Kitty.init(FIRE_W, FIRE_H) else null;
-    defer if (kitty) |*k| k.deinit();
     const kitty_rows: u64 = @max(1, term_sz.height -| 1);
+    if (mode == .kitty) queryTerm();
+    var kitty: ?Kitty = if (mode == .kitty) try Kitty.init(FIRE_W, FIRE_H, FIRE_W, kitty_rows) else null;
+    defer if (kitty) |*k| k.deinit();
     const status_pos = try std.fmt.allocPrint(allocator, csi ++ "{d};1H", .{term_sz.height});
     defer allocator.free(status_pos);
 
     //get to work!
-    try initBuf(if (mode == .kitty) Kitty.frameCap(FIRE_W, FIRE_H) + status_pos.len else 0);
+    try initBuf(if (kitty) |*k| k.frameCap() + status_pos.len else 0);
     defer freeBuf();
 
     //when there is an ez way to poll for key stroke...do that.  for now, ctrl+c!
@@ -1030,7 +1223,7 @@ pub fn showDoomFire() !void {
         if (kitty) |*k| {
             resetBuf();
             drawBuf(cursor_home);
-            try k.drawFrame(screen_buf, FIRE_W, FIRE_H, FIRE_W, kitty_rows);
+            try k.drawFrame(screen_buf);
             drawBuf(status_pos);
             try paintBuf();
             continue;
