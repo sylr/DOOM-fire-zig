@@ -713,6 +713,10 @@ pub fn paintBuf() !void {
         try emit(fg[0]);
     }
     try emitFmt("mem: {Bi:.2} min / {Bi:.2} avg / {Bi:.2} max [ {d:.2} fps ]", .{ bs_sz_min, bs_sz_avg, bs_sz_max, fps });
+    // the stats line can shrink between frames: wipe what the previous, longer one left behind.
+    // text mode: switch to a black bg first so the erase doesn't paint the row with the last fire color.
+    if (mode == .text) try emit(bg[0]);
+    try emit(line_clear_to_eol);
 }
 
 // initBuf(); defer freeBuf();
